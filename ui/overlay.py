@@ -1,6 +1,7 @@
 import threading
 import time
 import numpy as np
+import win32con
 import win32gui
 from PyQt6.QtWidgets import (
     QWidget, QFrame, QVBoxLayout, QHBoxLayout,
@@ -196,7 +197,8 @@ class OverlayWindow(QWidget):
         self._sig_hotkey_press.connect(self._hotkey_press_main)
         self._sig_hotkey_release.connect(self._hotkey_release_main)
 
-        self._tracked_hwnd: int = 0   # last non-overlay foreground window
+        self._tracked_hwnd: int = 0   # last non-overlay, non-tool foreground window
+        self._pinned_hwnd: int = 0    # manually pinned target (0 = use tracked)
         self._live_worker = None
 
         self._setup_window()
@@ -250,6 +252,12 @@ class OverlayWindow(QWidget):
         self._expand_btn.setToolTip("Показать/скрыть транскрипцию")
         self._expand_btn.clicked.connect(self._toggle_transcript)
         toolbar.addWidget(self._expand_btn)
+
+        self._pin_btn = QPushButton("📌")
+        self._pin_btn.setObjectName("IconBtn")
+        self._pin_btn.setToolTip("Зафиксировать окно для вставки (авто)")
+        self._pin_btn.clicked.connect(self._toggle_pin)
+        toolbar.addWidget(self._pin_btn)
 
         settings_btn = QPushButton("⚙")
         settings_btn.setObjectName("IconBtn")
@@ -329,10 +337,42 @@ class OverlayWindow(QWidget):
     def _poll_foreground(self):
         try:
             hwnd = win32gui.GetForegroundWindow()
-            if hwnd and hwnd != int(self.winId()):
-                self._tracked_hwnd = hwnd
+            if not hwnd or hwnd == int(self.winId()):
+                return
+            # Skip tool windows: Discord overlays, subtitle windows, system popups
+            ex = win32gui.GetWindowLong(hwnd, win32con.GWL_EXSTYLE)
+            if ex & win32con.WS_EX_TOOLWINDOW:
+                return
+            # Must be visible and have non-empty title or be a proper app window
+            if not win32gui.IsWindowVisible(hwnd):
+                return
+            self._tracked_hwnd = hwnd
         except Exception:
             pass
+
+    @property
+    def _inject_hwnd(self) -> int:
+        return self._pinned_hwnd if self._pinned_hwnd else self._tracked_hwnd
+
+    def _toggle_pin(self):
+        if self._pinned_hwnd:
+            self._pinned_hwnd = 0
+        else:
+            self._pinned_hwnd = self._inject_hwnd
+        self._update_pin_btn()
+
+    def _update_pin_btn(self):
+        if self._pinned_hwnd:
+            try:
+                title = win32gui.GetWindowText(self._pinned_hwnd)
+                short = title[:22] + "…" if len(title) > 22 else title
+            except Exception:
+                short = "?"
+            self._pin_btn.setToolTip(f"Зафиксировано: {short}\nНажми чтобы открепить")
+            self._pin_btn.setStyleSheet("color: #ffcc44;")
+        else:
+            self._pin_btn.setToolTip("Зафиксировать окно для вставки\n(сейчас: авто-трекинг)")
+            self._pin_btn.setStyleSheet("")
 
     # ── Recording ─────────────────────────────────────────────────────────────
 
@@ -410,7 +450,7 @@ class OverlayWindow(QWidget):
             new_words = self._diff_new_words(self._last_injected_text, text)
             if new_words:
                 self._last_injected_text = text
-                hwnd = self._tracked_hwnd
+                hwnd = self._inject_hwnd
                 threading.Thread(
                     target=inj.inject_text, args=(new_words, hwnd), daemon=True
                 ).start()
@@ -474,7 +514,7 @@ class OverlayWindow(QWidget):
             # Inject only what wasn't injected live yet (remaining tail)
             remaining = self._diff_new_words(self._last_injected_text, text)
             if remaining:
-                hwnd = self._tracked_hwnd
+                hwnd = self._inject_hwnd
                 threading.Thread(
                     target=inj.inject_text, args=(remaining, hwnd), daemon=True
                 ).start()
@@ -490,7 +530,7 @@ class OverlayWindow(QWidget):
             )
             # Inject only first target language into active window
             if self.config.get("auto_inject") and lang == first_lang:
-                hwnd = self._tracked_hwnd
+                hwnd = self._inject_hwnd
                 threading.Thread(
                     target=inj.inject_text, args=(translated, hwnd), daemon=True
                 ).start()
